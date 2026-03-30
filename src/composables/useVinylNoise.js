@@ -6,7 +6,8 @@ export function useVinylNoise(audioContext, intensity) {
   let hissShimmer = null
   let hissGain = null
   let running = false
-  let timeoutId = null
+  let crackleTimeoutId = null
+  let popTimeoutId = null
   let blobUrl = null
   let workletRegistered = false
 
@@ -50,7 +51,6 @@ export function useVinylNoise(audioContext, intensity) {
         // fall through to ScriptProcessor
       }
     }
-    // ScriptProcessor fallback
     const sp = ctx.createScriptProcessor(4096, 0, 1)
     sp.onaudioprocess = (e) => {
       const output = e.outputBuffer.getChannelData(0)
@@ -89,52 +89,39 @@ export function useVinylNoise(audioContext, intensity) {
     }
   }
 
-  // ── Pop / crackle event ───────────────────────────────────────────────────
-  function fireNoiseEvent() {
+  // ── Crackle: soft burst of highpass noise blending into surface texture ─────
+  function fireCrackle() {
     const ctx = audioContext.value
     if (!ctx) return
 
-    const isCrackle = Math.random() < 0.7
-    const isBigPop = !isCrackle && Math.random() < 0.05
     const scale = Math.max(0.01, intensity.value / 100)
-
+    const now = ctx.currentTime
     const sampleRate = ctx.sampleRate
-    const durationSec = isCrackle
-      ? (4 + Math.random() * 6) / 1000
-      : (15 + Math.random() * 20) / 1000
+    const durationSec = (8 + Math.random() * 14) / 1000   // 8–22 ms — long enough to not click
     const frameCount = Math.max(1, Math.floor(sampleRate * durationSec))
 
     const buffer = ctx.createBuffer(1, frameCount, sampleRate)
     const data = buffer.getChannelData(0)
     for (let i = 0; i < frameCount; i++) data[i] = Math.random() * 2 - 1
 
+    // Short fade-out at the buffer tail to prevent end-of-buffer click
+    const fadeFrames = Math.floor(sampleRate * 0.003)
+    for (let i = frameCount - fadeFrames; i < frameCount; i++) {
+      data[i] *= (frameCount - i) / fadeFrames
+    }
+
     const source = ctx.createBufferSource()
     source.buffer = buffer
 
     const filter = ctx.createBiquadFilter()
-    if (isCrackle) {
-      filter.type = 'highpass'
-      filter.frequency.value = 6000
-    } else {
-      filter.type = 'bandpass'
-      filter.frequency.value = 800 + Math.random() * 1200
-      filter.Q.value = 1.5
-    }
+    filter.type = 'highpass'
+    filter.frequency.value = 5000
 
     const gainNode = ctx.createGain()
-    let peakGain
-    if (isCrackle) {
-      peakGain = (0.25 + Math.random() * 0.25) * scale
-    } else if (isBigPop) {
-      peakGain = (0.6 + Math.random() * 0.3) * scale
-    } else {
-      peakGain = (0.35 + Math.random() * 0.30) * scale
-    }
-
-    const now = ctx.currentTime
-    const attackTime = isCrackle ? 0.001 : 0.003
+    // Keep gain low so crackles blend into hiss texture, not stand out as clicks
+    const peakGain = (0.06 + Math.random() * 0.06) * scale
     gainNode.gain.setValueAtTime(0, now)
-    gainNode.gain.linearRampToValueAtTime(peakGain, now + attackTime)
+    gainNode.gain.linearRampToValueAtTime(peakGain, now + 0.003)
     gainNode.gain.exponentialRampToValueAtTime(0.0001, now + durationSec)
 
     source.connect(filter)
@@ -146,23 +133,81 @@ export function useVinylNoise(audioContext, intensity) {
     }
   }
 
-  // ── Crackle scheduler ─────────────────────────────────────────────────────
-  function scheduleEvent() {
+  // ── Pop: damped sine at lower-mid frequency ───────────────────────────────
+  // 180–320 Hz sits in the range where vinyl pops are perceived — lower-mid,
+  // not sub-bass (which bashes) and not mid (which sounds like a click).
+  // Buffer fades out the last 4 ms to prevent the end-of-buffer snap click.
+  function firePop() {
+    const ctx = audioContext.value
+    if (!ctx) return
+
+    const scale = Math.max(0.01, intensity.value / 100)
+    const now = ctx.currentTime
+    const sampleRate = ctx.sampleRate
+
+    const isBig = Math.random() < 0.15
+    const freq        = isBig ? 130 + Math.random() * 70  : 180 + Math.random() * 140  // 130–200 / 180–320 Hz
+    const decayRate   = isBig ? 28 : 40
+    const durationSec = isBig ? 0.07 : 0.05
+    const frameCount  = Math.floor(sampleRate * durationSec)
+
+    const buffer = ctx.createBuffer(1, frameCount, sampleRate)
+    const data = buffer.getChannelData(0)
+    for (let i = 0; i < frameCount; i++) {
+      const t = i / sampleRate
+      data[i] = Math.sin(2 * Math.PI * freq * t) * Math.exp(-t * decayRate)
+    }
+
+    // Fade out last 4 ms to silence so the buffer end doesn't snap-click
+    const fadeFrames = Math.floor(sampleRate * 0.004)
+    for (let i = frameCount - fadeFrames; i < frameCount; i++) {
+      data[i] *= (frameCount - i) / fadeFrames
+    }
+
+    const source = ctx.createBufferSource()
+    source.buffer = buffer
+
+    const gainNode = ctx.createGain()
+    gainNode.gain.value = isBig
+      ? (0.16 + Math.random() * 0.10) * scale
+      : (0.09 + Math.random() * 0.08) * scale
+
+    source.connect(gainNode)
+    gainNode.connect(ctx.destination)
+    source.start(now)
+    source.onended = () => {
+      try { gainNode.disconnect(); source.disconnect() } catch (_) {}
+    }
+  }
+
+  // ── Separate schedulers for crackles and pops ────────────────────────────
+  // Crackles: frequent surface texture
+  function scheduleCrackle() {
     if (!running) return
-    const eps = 0.5 + (intensity.value / 100) * 4.5
+    const eps = 0.5 + (intensity.value / 100) * 4.0
     const delay = -Math.log(1 - Math.random()) / eps
-    timeoutId = setTimeout(() => {
+    crackleTimeoutId = setTimeout(() => {
       if (!running) return
-      fireNoiseEvent()
-      scheduleEvent()
+      fireCrackle()
+      scheduleCrackle()
     }, delay * 1000)
   }
 
-  function clearScheduler() {
-    if (timeoutId !== null) {
-      clearTimeout(timeoutId)
-      timeoutId = null
-    }
+  // Pops: rare, one every several seconds even at high intensity
+  function schedulePop() {
+    if (!running) return
+    const eps = 0.04 + (intensity.value / 100) * 0.25  // 0.04–0.29 /sec → 3–25 sec intervals
+    const delay = -Math.log(1 - Math.random()) / eps
+    popTimeoutId = setTimeout(() => {
+      if (!running) return
+      firePop()
+      schedulePop()
+    }, delay * 1000)
+  }
+
+  function clearSchedulers() {
+    if (crackleTimeoutId !== null) { clearTimeout(crackleTimeoutId); crackleTimeoutId = null }
+    if (popTimeoutId     !== null) { clearTimeout(popTimeoutId);     popTimeoutId = null }
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -170,10 +215,7 @@ export function useVinylNoise(audioContext, intensity) {
     const ctx = audioContext.value
     if (!ctx) return
 
-    // Tear down any existing nodes before rebuilding
     _teardown()
-
-    // Needle drop thump — fires immediately when play is pressed
     fireNeedleDrop(ctx)
 
     noiseNode = await buildNoiseNode(ctx)
@@ -197,13 +239,14 @@ export function useVinylNoise(audioContext, intensity) {
     hissGain.connect(ctx.destination)
 
     running = true
-    scheduleEvent()
+    scheduleCrackle()
+    schedulePop()
   }
 
   function pause() {
     if (!running) return
     running = false
-    clearScheduler()
+    clearSchedulers()
     if (hissGain) {
       try { hissGain.disconnect() } catch (_) {}
     }
@@ -212,20 +255,21 @@ export function useVinylNoise(audioContext, intensity) {
   function resume() {
     const ctx = audioContext.value
     if (!ctx || running) return
-    if (hissGain && hissShimmer) {
+    if (hissGain) {
       try { hissGain.connect(ctx.destination) } catch (_) {}
     }
     running = true
-    scheduleEvent()
+    scheduleCrackle()
+    schedulePop()
   }
 
   function _teardown() {
     running = false
-    clearScheduler()
-    if (noiseNode)    { try { noiseNode.disconnect()    } catch (_) {} ; noiseNode = null }
-    if (hissFilter)   { try { hissFilter.disconnect()   } catch (_) {} ; hissFilter = null }
-    if (hissShimmer)  { try { hissShimmer.disconnect()  } catch (_) {} ; hissShimmer = null }
-    if (hissGain)     { try { hissGain.disconnect()     } catch (_) {} ; hissGain = null }
+    clearSchedulers()
+    if (noiseNode)   { try { noiseNode.disconnect()   } catch (_) {} ; noiseNode = null }
+    if (hissFilter)  { try { hissFilter.disconnect()  } catch (_) {} ; hissFilter = null }
+    if (hissShimmer) { try { hissShimmer.disconnect() } catch (_) {} ; hissShimmer = null }
+    if (hissGain)    { try { hissGain.disconnect()    } catch (_) {} ; hissGain = null }
   }
 
   function stop() {

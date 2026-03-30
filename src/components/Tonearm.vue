@@ -80,14 +80,13 @@ const TIP_HALF   = 3    // half-width at the headshell end
 }
 
 @keyframes armWobble {
-  0%   { transform: rotate(-0.25deg); }
-  28%  { transform: rotate(0.20deg);  }
-  55%  { transform: rotate(-0.18deg); }
-  80%  { transform: rotate(0.28deg);  }
-  100% { transform: rotate(-0.25deg); }
+  0%   { transform: rotate(-0.06deg); }
+  35%  { transform: rotate(0.05deg);  }
+  65%  { transform: rotate(-0.04deg); }
+  100% { transform: rotate(0.06deg);  }
 }
 
 .tonearm-wobble.wobbling {
-  animation: armWobble 0.42s ease-in-out infinite;
+  animation: armWobble 1.1s ease-in-out infinite alternate;
 }
 </style>
